@@ -8,6 +8,7 @@ last_crop.jpg
 har_assets/*.b64
 har_assets/*.jpg
 har_assets/*.png
+profiles/_upload_tmp/
 
 # Perfiles / sesiones
 profiles/

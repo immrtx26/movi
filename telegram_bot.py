@@ -50,12 +50,14 @@ from profile_pool import (
     user_holds_profile,
 )
 from profile_prepare import prepare_all
+from profile_upload import cleanup_upload_dir, commit_validated_profile
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
-MENU, PHONE, OTP, REDEEM_KEY = range(4)
+MENU, PHONE, OTP, REDEEM_KEY, ADD_FRONT, ADD_BACK, ADD_SELFIE = range(7)
 FLOW_TIMEOUT = 600  # 10 min inactividad
+UPLOAD_TMP = ROOT / "profiles" / "_upload_tmp"
 
 ADMIN_IDS: set[int] = set()
 _owner = int(os.getenv("TELEGRAM_OWNER_ID", "0") or "0")
@@ -120,6 +122,7 @@ def cleanup_user_flow(
         release_all_for_user(uid)
 
     close_hubox_session(context)
+    cleanup_upload_dir(context.user_data.get("upload_dir"))
 
     if refund_if_charged and context.user_data.pop("credit_charged", False):
         refund_credit(uid, "reembolso_cancel")
@@ -127,9 +130,38 @@ def cleanup_user_flow(
     context.user_data.clear()
 
 
+def _upload_staging_dir(uid: int) -> Path:
+    path = UPLOAD_TMP / str(uid)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+async def _save_user_image(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    dest: Path,
+) -> Path | None:
+    """Guarda foto o documento de imagen enviada por el usuario."""
+    msg = update.effective_message
+    if not msg:
+        return None
+    file_id = None
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        file_id = msg.document.file_id
+    if not file_id:
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tg_file = await context.bot.get_file(file_id)
+    await tg_file.download_to_drive(custom_path=str(dest))
+    return dest
+
+
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("➕ Agregar perfiles", callback_data="act:add_profile")],
             [InlineKeyboardButton("📱 Nueva vinculación", callback_data="act:link")],
             [InlineKeyboardButton("🔑 Canjear key", callback_data="act:redeem")],
             [InlineKeyboardButton("💳 Comprar key", callback_data="act:buy")],
@@ -361,6 +393,142 @@ async def on_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return PHONE
 
+    if action == "add_profile":
+        cleanup_user_flow(context, uid, refund_if_charged=True)
+        staging = _upload_staging_dir(uid)
+        cleanup_upload_dir(staging)
+        staging = _upload_staging_dir(uid)
+        context.user_data["upload_dir"] = staging
+        context.user_data["flow_uid"] = uid
+        context.user_data["add_step"] = "frente"
+        await query.edit_message_text(
+            "➕ *Agregar perfil*\n\n"
+            "Envía la foto del *frente* (anverso) de la INE.\n\n"
+            "_Orden: frente → reverso → selfie._\n"
+            "Solo se agrega al pool si pasa la validación "
+            "(2 QR binarios en reverso + rostro en selfie).\n\n"
+            "Usa /cancel para salir.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ADD_FRONT
+
+    return MENU
+
+
+async def on_add_expect_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recuerda enviar imagen durante el flujo de alta."""
+    state = context.user_data.get("add_step") or "frente"
+    await update.effective_message.reply_text(
+        f"Necesito una *imagen* del {state}. Envía una foto (no texto).",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    step = context.user_data.get("add_step")
+    if step == "reverso":
+        return ADD_BACK
+    if step == "selfie":
+        return ADD_SELFIE
+    return ADD_FRONT
+
+
+async def on_add_front(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = user_id(update)
+    staging = context.user_data.get("upload_dir") or _upload_staging_dir(uid)
+    context.user_data["upload_dir"] = staging
+    dest = staging / "front.jpg"
+    saved = await _save_user_image(update, context, dest)
+    if not saved:
+        await update.effective_message.reply_text(
+            "Envía una *foto* del frente de la INE (imagen).",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ADD_FRONT
+    context.user_data["upload_front"] = str(dest)
+    context.user_data["add_step"] = "reverso"
+    await update.effective_message.reply_text(
+        "✅ Frente recibido.\n\nAhora envía la foto del *reverso* de la INE "
+        "(debe verse nítido, con los 2 códigos QR).",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ADD_BACK
+
+
+async def on_add_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = user_id(update)
+    staging = context.user_data.get("upload_dir") or _upload_staging_dir(uid)
+    dest = staging / "back.jpg"
+    saved = await _save_user_image(update, context, dest)
+    if not saved:
+        await update.effective_message.reply_text(
+            "Envía una *foto* del reverso de la INE (imagen).",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ADD_BACK
+    context.user_data["upload_back"] = str(dest)
+    context.user_data["add_step"] = "selfie"
+    await update.effective_message.reply_text(
+        "✅ Reverso recibido.\n\nAhora envía la *selfie* (cara frontal, buena luz).",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ADD_SELFIE
+
+
+async def on_add_selfie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = user_id(update)
+    staging = context.user_data.get("upload_dir") or _upload_staging_dir(uid)
+    dest = staging / "selfie.jpg"
+    saved = await _save_user_image(update, context, dest)
+    if not saved:
+        await update.effective_message.reply_text(
+            "Envía una *foto* selfie (imagen).",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ADD_SELFIE
+
+    front = Path(context.user_data.get("upload_front") or staging / "front.jpg")
+    back = Path(context.user_data.get("upload_back") or staging / "back.jpg")
+    if not front.is_file() or not back.is_file():
+        cleanup_upload_dir(staging)
+        context.user_data.clear()
+        await update.effective_message.reply_text(
+            "❌ Faltan fotos del proceso. Empieza de nuevo desde el menú."
+        )
+        return await show_menu(update, context, cleanup=False)
+
+    await update.effective_message.reply_text(
+        "⏳ Validando perfil y preparando far/close face (480×640)…"
+    )
+    await update.effective_chat.send_action(ChatAction.TYPING)
+
+    result = await asyncio.to_thread(
+        commit_validated_profile,
+        front,
+        back,
+        dest,
+        label=f"User {uid}",
+        uploaded_by=uid,
+    )
+    cleanup_upload_dir(staging)
+    context.user_data.clear()
+
+    if not result.ok:
+        detail = "\n".join(f"• {e}" for e in (result.errors or ["validación fallida"]))
+        await update.effective_message.reply_text(
+            "❌ *Perfil no apto — no se agregó al pool.*\n\n"
+            f"{detail}\n\n"
+            "Corrige las fotos e intenta de nuevo con *Agregar perfiles*.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu_keyboard(),
+        )
+        return MENU
+
+    await update.effective_message.reply_text(
+        "✅ *Perfil agregado al pool*\n\n"
+        f"ID: `{result.profile_id}`\n"
+        f"Label: {result.label}\n"
+        "Listo: frente, reverso (2 QR), selfie + far/close 480×640.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_keyboard(),
+    )
     return MENU
 
 
@@ -522,6 +690,7 @@ def main() -> None:
 
     app = Application.builder().token(token).build()
 
+    photo_or_image = (filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
@@ -529,6 +698,18 @@ def main() -> None:
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_phone)],
             OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_otp)],
             REDEEM_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_redeem_key)],
+            ADD_FRONT: [
+                MessageHandler(photo_or_image, on_add_front),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_add_expect_photo),
+            ],
+            ADD_BACK: [
+                MessageHandler(photo_or_image, on_add_back),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_add_expect_photo),
+            ],
+            ADD_SELFIE: [
+                MessageHandler(photo_or_image, on_add_selfie),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_add_expect_photo),
+            ],
             ConversationHandler.TIMEOUT: [
                 CallbackQueryHandler(on_timeout),
                 MessageHandler(filters.ALL, on_timeout),

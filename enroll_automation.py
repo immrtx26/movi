@@ -287,7 +287,16 @@ def complete_enroll(
         raise FlowError("OTP debe tener 4 dígitos.", refundable=False, retry_otp=True)
 
     frente_b64 = _b64_or_text(profile.frente_path)
-    far_b64, close_b64 = _selfie_pair_480x640(profile.selfie_path)
+    if (
+        profile.far_path
+        and profile.close_path
+        and profile.far_path.is_file()
+        and profile.close_path.is_file()
+    ):
+        far_b64 = _b64_or_text(profile.far_path)
+        close_b64 = _b64_or_text(profile.close_path)
+    else:
+        far_b64, close_b64 = _selfie_pair_480x640(profile.selfie_path)
 
     try:
         val = hubox.valida_otp(track_id, otp)

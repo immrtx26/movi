@@ -30,6 +30,8 @@ SELFIE_NAMES = (
 )
 BACK_NAMES = ("back.jpg", "reverso.jpg", "REVERSO.png", "REVERSO.jpeg", "INE_BACK.jpeg")
 OCR_NAMES = ("ocr.json", "ocr_data.json")
+FAR_NAMES = ("far.png", "far.jpg", "selfie_far.b64", "far.b64")
+CLOSE_NAMES = ("close.png", "close.jpg", "selfie_close.b64", "close.b64")
 
 
 @dataclass
@@ -42,6 +44,8 @@ class Profile:
     hubox_user: str = ""
     hubox_password: str = ""
     back_path: Path | None = None
+    far_path: Path | None = None
+    close_path: Path | None = None
 
     @property
     def root(self) -> Path:
@@ -262,6 +266,8 @@ def scan_profile_folder(folder: Path, global_cfg: dict[str, Any]) -> ProfileScan
     selfie = _find_first(folder, SELFIE_NAMES)
     ocr_file = _find_first(folder, OCR_NAMES)
     back = _find_first(folder, BACK_NAMES)
+    far = _find_first(folder, FAR_NAMES)
+    close = _find_first(folder, CLOSE_NAMES)
 
     hubox_user = str(local_cfg.get("hubox_user") or global_cfg.get("hubox_user") or "")
     hubox_password = str(local_cfg.get("hubox_password") or global_cfg.get("hubox_password") or "")
@@ -288,6 +294,8 @@ def scan_profile_folder(folder: Path, global_cfg: dict[str, Any]) -> ProfileScan
         return ProfileScan(id=folder_id, label=label, folder=folder, ready=False, errors=errors, warnings=warnings)
 
     assert frente is not None and selfie is not None
+    if far is None or close is None:
+        warnings.append("far/close 480x640 no pregenerados (se crearán al vincular)")
     profile = Profile(
         id=folder_id,
         label=label,
@@ -297,6 +305,8 @@ def scan_profile_folder(folder: Path, global_cfg: dict[str, Any]) -> ProfileScan
         hubox_user=hubox_user,
         hubox_password=hubox_password,
         back_path=back.resolve() if back else None,
+        far_path=far.resolve() if far else None,
+        close_path=close.resolve() if close else None,
     )
     return ProfileScan(
         id=folder_id,
