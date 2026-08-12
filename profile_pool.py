@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 import time
 from dataclasses import dataclass, field
@@ -216,6 +217,33 @@ def discard_profile(profile_id: str, reason: str = "") -> None:
         if int(entry.get("successes", 0)) < MAX_SUCCESSES_PER_PROFILE:
             entry["successes"] = MAX_SUCCESSES_PER_PROFILE
         _save_usage(data)
+
+
+def remove_profile(profile_id: str) -> bool:
+    """Elimina perfil del pool: lock, usage y carpeta en disco."""
+    pid = str(profile_id)
+    folder = PROFILES_DIR / pid
+    with _lock:
+        _busy.pop(pid, None)
+        data = _load_usage()
+        profiles = data.setdefault("profiles", {})
+        if pid in profiles:
+            profiles.pop(pid, None)
+            _save_usage(data)
+    if folder.is_dir():
+        shutil.rmtree(folder, ignore_errors=True)
+    return not folder.exists()
+
+
+def is_profile_busy(profile_id: str, *, ignore_user_id: int | None = None) -> bool:
+    with _lock:
+        _purge_stale_locks()
+        holder = _busy.get(str(profile_id))
+        if holder is None:
+            return False
+        if ignore_user_id is not None and holder[0] == ignore_user_id:
+            return False
+        return True
 
 
 def record_profile_success(profile_id: str) -> int:

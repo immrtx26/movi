@@ -10,12 +10,20 @@ from pathlib import Path
 from typing import Any
 
 from enroll_automation import _extract_qrs_from_reverso, _selfie_pair_480x640
-from profile_pool import PROFILES_DIR, _validate_image
+from profile_pool import (
+    MAX_SUCCESSES_PER_PROFILE,
+    PROFILES_DIR,
+    _validate_image,
+    is_profile_busy,
+    profile_usage_info,
+    remove_profile,
+)
 
 FAR_TARGET = "far.png"
 CLOSE_TARGET = "close.png"
 FAR_B64_TARGET = "selfie_far.b64"
 CLOSE_B64_TARGET = "selfie_close.b64"
+MAX_PROFILES_PER_USER = 10
 
 
 @dataclass
@@ -169,6 +177,102 @@ def validate_upload_images(
     )
 
 
+def _read_folder_config(folder: Path) -> dict[str, Any]:
+    path = folder / "config.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def is_user_uploaded_profile(profile_id: str) -> bool:
+    folder = PROFILES_DIR / str(profile_id)
+    if not folder.is_dir():
+        return False
+    cfg = _read_folder_config(folder)
+    return cfg.get("source") == "user_upload" or bool(cfg.get("uploaded_by"))
+
+
+def list_user_profiles(user_id: int) -> list[dict[str, Any]]:
+    """Perfiles subidos por el usuario (carpetas numéricas con uploaded_by)."""
+    if not PROFILES_DIR.is_dir():
+        return []
+    items: list[dict[str, Any]] = []
+    for folder in PROFILES_DIR.iterdir():
+        if not folder.is_dir() or not folder.name.isdigit():
+            continue
+        cfg = _read_folder_config(folder)
+        try:
+            owner = int(cfg.get("uploaded_by") or 0)
+        except (TypeError, ValueError):
+            owner = 0
+        if owner != int(user_id):
+            continue
+        usage = profile_usage_info(folder.name)
+        items.append(
+            {
+                "id": folder.name,
+                "label": str(cfg.get("label") or f"Perfil {folder.name}"),
+                "successes": usage["successes"],
+                "remaining": usage["remaining"],
+                "discarded": usage["discarded"],
+                "max_successes": MAX_SUCCESSES_PER_PROFILE,
+            }
+        )
+    items.sort(key=lambda x: int(x["id"]))
+    return items
+
+
+def count_user_profiles(user_id: int) -> int:
+    return len(list_user_profiles(user_id))
+
+
+def user_can_add_profile(user_id: int) -> tuple[bool, str]:
+    n = count_user_profiles(user_id)
+    if n >= MAX_PROFILES_PER_USER:
+        return (
+            False,
+            f"Ya tienes {n}/{MAX_PROFILES_PER_USER} perfiles. "
+            "Borra uno en Mis perfiles para agregar otro.",
+        )
+    return True, f"{n}/{MAX_PROFILES_PER_USER}"
+
+
+def delete_user_profile(user_id: int, profile_id: str) -> tuple[bool, str]:
+    """Borrado manual: solo el dueño puede eliminar su perfil."""
+    pid = str(profile_id)
+    folder = PROFILES_DIR / pid
+    if not folder.is_dir():
+        return False, "Perfil no encontrado."
+    cfg = _read_folder_config(folder)
+    try:
+        owner = int(cfg.get("uploaded_by") or 0)
+    except (TypeError, ValueError):
+        owner = 0
+    if owner != int(user_id):
+        return False, "Solo puedes borrar perfiles que tú agregaste."
+    if is_profile_busy(pid, ignore_user_id=int(user_id)):
+        return False, "Perfil en uso por otra vinculación. Intenta más tarde."
+
+    ok = remove_profile(pid)
+    if not ok and folder.exists():
+        return False, "No se pudo borrar la carpeta del perfil."
+    return True, f"Perfil `{pid}` eliminado."
+
+
+def maybe_purge_exhausted_profile(profile_id: str) -> bool:
+    """Si el perfil de usuario llegó a 10 activaciones (o descartado), bórralo del disco."""
+    if not is_user_uploaded_profile(profile_id):
+        return False
+    usage = profile_usage_info(profile_id)
+    if usage["discarded"] or usage["successes"] >= MAX_SUCCESSES_PER_PROFILE:
+        return remove_profile(profile_id)
+    return False
+
+
 def commit_validated_profile(
     front_path: Path,
     back_path: Path,
@@ -178,6 +282,11 @@ def commit_validated_profile(
     uploaded_by: int | None = None,
 ) -> UploadResult:
     """Valida y, solo si pasa, copia al pool como carpeta numérica."""
+    if uploaded_by is not None:
+        can, detail = user_can_add_profile(uploaded_by)
+        if not can:
+            return UploadResult(ok=False, errors=[detail])
+
     staging = Path(tempfile.mkdtemp(prefix="profile_upload_"))
     try:
         front_dst = staging / "front.jpg"
@@ -190,6 +299,12 @@ def commit_validated_profile(
         check = validate_upload_images(front_dst, back_dst, selfie_dst)
         if not check.ok:
             return UploadResult(ok=False, errors=check.errors, warnings=check.warnings)
+
+        # Re-check quota under race (otro upload paralelo)
+        if uploaded_by is not None:
+            can, detail = user_can_add_profile(uploaded_by)
+            if not can:
+                return UploadResult(ok=False, errors=[detail])
 
         profile_id = str(next_profile_id())
         dest = PROFILES_DIR / profile_id

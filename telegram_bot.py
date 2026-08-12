@@ -50,7 +50,16 @@ from profile_pool import (
     user_holds_profile,
 )
 from profile_prepare import prepare_all
-from profile_upload import cleanup_upload_dir, commit_validated_profile
+from profile_upload import (
+    MAX_PROFILES_PER_USER,
+    cleanup_upload_dir,
+    commit_validated_profile,
+    count_user_profiles,
+    delete_user_profile,
+    list_user_profiles,
+    maybe_purge_exhausted_profile,
+    user_can_add_profile,
+)
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -162,11 +171,41 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("➕ Agregar perfiles", callback_data="act:add_profile")],
+            [InlineKeyboardButton("🗂 Mis perfiles", callback_data="act:my_profiles")],
             [InlineKeyboardButton("📱 Nueva vinculación", callback_data="act:link")],
             [InlineKeyboardButton("🔑 Canjear key", callback_data="act:redeem")],
             [InlineKeyboardButton("💳 Comprar key", callback_data="act:buy")],
         ]
     )
+
+
+def after_upload_keyboard(uid: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    can, _ = user_can_add_profile(uid)
+    if can:
+        rows.append([InlineKeyboardButton("➕ Agregar otro", callback_data="act:add_profile")])
+    rows.append([InlineKeyboardButton("🗂 Mis perfiles", callback_data="act:my_profiles")])
+    rows.append([InlineKeyboardButton("« Menú", callback_data="act:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def my_profiles_keyboard(uid: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in list_user_profiles(uid):
+        short = (p["label"] or p["id"])[:18]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🗑 {p['id']} {short} ({p['successes']}/{p['max_successes']})",
+                    callback_data=f"delask:{p['id']}",
+                )
+            ]
+        )
+    can, _ = user_can_add_profile(uid)
+    if can:
+        rows.append([InlineKeyboardButton("➕ Agregar perfil", callback_data="act:add_profile")])
+    rows.append([InlineKeyboardButton("« Menú", callback_data="act:menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 def format_success(result: dict) -> str:
@@ -211,10 +250,13 @@ async def show_menu(
         context.user_data.clear()
 
     credits = get_credits(uid)
+    mine = count_user_profiles(uid)
     text = (
         "📱 *Bot Vinculación Movistar*\n\n"
         f"Activaciones disponibles: *{credits}*\n"
-        f"Costo por vinculación: *${ACTIVATION_COST_MXN} MXN*\n\n"
+        f"Costo por vinculación: *${ACTIVATION_COST_MXN} MXN*\n"
+        f"Tus perfiles: *{mine}/{MAX_PROFILES_PER_USER}* "
+        f"(máx {MAX_SUCCESSES_PER_PROFILE} usos c/u)\n\n"
         "Elige una opción:"
     )
     kb = main_menu_keyboard()
@@ -395,6 +437,18 @@ async def on_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if action == "add_profile":
         cleanup_user_flow(context, uid, refund_if_charged=True)
+        can, detail = user_can_add_profile(uid)
+        if not can:
+            await query.edit_message_text(
+                f"⚠️ {detail}",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("🗂 Mis perfiles", callback_data="act:my_profiles")],
+                        [InlineKeyboardButton("« Menú", callback_data="act:menu")],
+                    ]
+                ),
+            )
+            return MENU
         staging = _upload_staging_dir(uid)
         cleanup_upload_dir(staging)
         staging = _upload_staging_dir(uid)
@@ -403,14 +457,97 @@ async def on_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["add_step"] = "frente"
         await query.edit_message_text(
             "➕ *Agregar perfil*\n\n"
+            f"Cupo: *{detail}*\n\n"
             "Envía la foto del *frente* (anverso) de la INE.\n\n"
             "_Orden: frente → reverso → selfie._\n"
-            "Solo se agrega al pool si pasa la validación "
-            "(2 QR binarios en reverso + rostro en selfie).\n\n"
+            "Puedes agregar varios (máx 10). Solo entran al pool si pasan validación.\n"
+            f"Cada perfil se borra solo al llegar a {MAX_SUCCESSES_PER_PROFILE} activaciones "
+            "o cuando tú lo elimines.\n\n"
             "Usa /cancel para salir.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ADD_FRONT
+
+    if action == "my_profiles":
+        return await show_my_profiles(update, context, edit=True)
+
+    return MENU
+
+
+async def show_my_profiles(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    edit: bool = False,
+) -> int:
+    uid = user_id(update)
+    items = list_user_profiles(uid)
+    if not items:
+        text = (
+            "🗂 *Mis perfiles*\n\n"
+            "No tienes perfiles cargados.\n"
+            f"Puedes agregar hasta *{MAX_PROFILES_PER_USER}*."
+        )
+    else:
+        lines = [
+            "🗂 *Mis perfiles*\n",
+            f"Total: *{len(items)}/{MAX_PROFILES_PER_USER}*\n"
+            f"Toque 🗑 para borrar. Se eliminan solos tras "
+            f"{MAX_SUCCESSES_PER_PROFILE} activaciones.\n",
+        ]
+        for p in items:
+            st = "agotado" if p["discarded"] else f"{p['successes']}/{p['max_successes']} usos"
+            lines.append(f"• `{p['id']}` — {p['label'][:40]} ({st})")
+        text = "\n".join(lines)
+    kb = my_profiles_keyboard(uid)
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+        )
+    elif update.effective_message:
+        await update.effective_message.reply_text(
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+        )
+    return MENU
+
+
+async def on_delete_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    data = query.data or ""
+
+    if data.startswith("delask:"):
+        pid = data.split(":", 1)[1]
+        await query.edit_message_text(
+            f"¿Borrar el perfil `{pid}`?\nEsta acción no se puede deshacer.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("✅ Sí, borrar", callback_data=f"delok:{pid}"),
+                        InlineKeyboardButton("❌ No", callback_data="act:my_profiles"),
+                    ]
+                ]
+            ),
+        )
+        return MENU
+
+    if data.startswith("delok:"):
+        pid = data.split(":", 1)[1]
+        ok, msg = await asyncio.to_thread(delete_user_profile, uid, pid)
+        prefix = "✅ " if ok else "❌ "
+        await query.edit_message_text(
+            prefix + msg,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🗂 Mis perfiles", callback_data="act:my_profiles")],
+                    [InlineKeyboardButton("« Menú", callback_data="act:menu")],
+                ]
+            ),
+        )
+        return MENU
 
     return MENU
 
@@ -517,17 +654,20 @@ async def on_add_selfie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             f"{detail}\n\n"
             "Corrige las fotos e intenta de nuevo con *Agregar perfiles*.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=main_menu_keyboard(),
+            reply_markup=after_upload_keyboard(uid),
         )
         return MENU
 
+    total = count_user_profiles(uid)
     await update.effective_message.reply_text(
-        "✅ *Perfil agregado al pool*\n\n"
+        "✅ *Perfil agregado y listo*\n\n"
         f"ID: `{result.profile_id}`\n"
         f"Label: {result.label}\n"
-        "Listo: frente, reverso (2 QR), selfie + far/close 480×640.",
+        f"Tus perfiles: *{total}/{MAX_PROFILES_PER_USER}*\n"
+        f"Usos máximos: {MAX_SUCCESSES_PER_PROFILE} (luego se elimina solo).\n"
+        "frente + reverso (2 QR) + selfie + far/close 480×640.",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_menu_keyboard(),
+        reply_markup=after_upload_keyboard(uid),
     )
     return MENU
 
@@ -653,9 +793,23 @@ async def on_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         release_profile(profile_id, uid)
         close_hubox_session(context)
         context.user_data.clear()
+        purged = False
         if count >= MAX_SUCCESSES_PER_PROFILE:
-            log.info("Perfil %s descartado tras %s/%s éxitos", profile_id, count, MAX_SUCCESSES_PER_PROFILE)
-        await update.effective_message.reply_text(format_success(result), parse_mode=ParseMode.MARKDOWN)
+            purged = maybe_purge_exhausted_profile(profile_id)
+            log.info(
+                "Perfil %s agotado tras %s/%s éxitos (purgado=%s)",
+                profile_id,
+                count,
+                MAX_SUCCESSES_PER_PROFILE,
+                purged,
+            )
+        msg = format_success(result)
+        if purged:
+            msg += (
+                f"\n\n🗑 Perfil `{profile_id}` alcanzó "
+                f"{MAX_SUCCESSES_PER_PROFILE} activaciones y fue eliminado."
+            )
+        await update.effective_message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
         return await show_menu(update, context, cleanup=False)
 
     except NetworkError as exc:
@@ -671,7 +825,10 @@ async def on_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             return OTP
         if exc.discard_profile and profile_id:
             discard_profile(profile_id, str(exc))
-            log.info("Perfil %s descartado: %s", profile_id, exc)
+            if maybe_purge_exhausted_profile(profile_id):
+                log.info("Perfil %s descartado y eliminado: %s", profile_id, exc)
+            else:
+                log.info("Perfil %s descartado: %s", profile_id, exc)
         cleanup_user_flow(context, uid, refund_if_charged=exc.refundable)
         await reply_fail(update, str(exc), refunded=exc.refundable)
         return await show_menu(update, context, cleanup=False)
@@ -694,7 +851,10 @@ def main() -> None:
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
-            MENU: [CallbackQueryHandler(on_menu_action, pattern=r"^act:")],
+            MENU: [
+                CallbackQueryHandler(on_menu_action, pattern=r"^act:"),
+                CallbackQueryHandler(on_delete_profile, pattern=r"^del(ask|ok):"),
+            ],
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_phone)],
             OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_otp)],
             REDEEM_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_redeem_key)],
