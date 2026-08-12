@@ -1,0 +1,55 @@
+{
+  "detect_ine_resp": {
+    "isFake": 5.5,
+    "isREV": false,
+    "isGH": true
+  },
+  "ocr_resp": {
+    "success": true,
+    "tipo_ine": "G",
+    "step": 3
+  },
+  "qrs_resp": {
+    "success": true,
+    "tipo_ine": "G",
+    "tipo_credencial": "N",
+    "step": 4
+  },
+  "qrs_req_keys": [
+    "qr_b64_1",
+    "qr_b64_2",
+    "track_id",
+    "access_key"
+  ],
+  "biometric_resp": {
+    "success": true,
+    "step": 7,
+    "async": false,
+    "track_id": "935e538c-b06e-4e4d-9b2e-23b0b968e2e1",
+    "id_ecommerce": null,
+    "curp": "GUDJ960826HGTRRN07",
+    "nombre_bd": "GUERRERO DURAN JUAN FERNANDO",
+    "tipo_ine": "G",
+    "similarity": "84.92",
+    "live": "0.999",
+    "prediction": "REAL",
+    "details": "{\"mode\":\"Balanced\",\"features\":{\"quadfar\":0.1529,\"quadnear\":0.4745,\"S_spooff\":1.0,\"R_far\":1.0,\"R_near\":1.0,\"AVG_R\":1.0},\"lr\":{\"p_real\":0.999,\"threshold\":0.5},\"face_match\":{\"similarity\":94.7721,\"threshold\":85.0,\"match\":true},\"reported\":{\"live\":0.999,\"source\":\"LR\"}}",
+    "flujo": "movistar_registro",
+    "webhook_back": {
+      "lambda": "movistar_webhook_back",
+      "result": {
+        "success": true,
+        "track_id": "935e538c-b06e-4e4d-9b2e-23b0b968e2e1",
+        "step": 7,
+        "intentos_webhook": 1,
+        "webhook_transaction_id": "TRX-1785379114950-y0qxly"
+      }
+    },
+    "step_db_after": 7,
+    "ddb_err": null
+  },
+  "devices": "camera 1, facing front 480x640",
+  "access_key": "ak_TelefonicaPruebas",
+  "flujo": "movistar_registro",
+  "ambiente": "movistar_prod"
+}

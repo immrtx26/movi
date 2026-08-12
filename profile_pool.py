@@ -1,0 +1,503 @@
+"""Pool de perfiles Hubox desde movistar_perfiles con validación previa."""
+from __future__ import annotations
+
+import json
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent
+PROFILES_DIR = ROOT / "profiles" / "movistar_perfiles"
+MAX_PROFILES = 250
+MAX_SUCCESSES_PER_PROFILE = 10
+LOCK_TTL_SECONDS = 900
+USAGE_PATH = ROOT / "profile_usage.json"
+MIN_IMAGE_BYTES = 2048
+OCR_REQUIRED_KEYS = ("nombre", "curp", "clave_elector", "direccion")
+
+_lock = threading.Lock()
+_busy: dict[str, tuple[int, float]] = {}
+
+FRENTE_NAMES = (
+    "front.jpg", "frente.jpg", "FRENTE.jpeg", "FRENTE.jpg", "FRENTE.png",
+    "frente.b64", "ine_frente.b64",
+)
+SELFIE_NAMES = (
+    "selfie.jpg", "SELFIE.jpeg", "SELFIE.jpg", "SELFIE.png",
+    "selfie.b64", "selfie_far.b64",
+)
+BACK_NAMES = ("back.jpg", "reverso.jpg", "REVERSO.png", "REVERSO.jpeg", "INE_BACK.jpeg")
+OCR_NAMES = ("ocr.json", "ocr_data.json")
+
+
+@dataclass
+class Profile:
+    id: str
+    label: str
+    frente_path: Path
+    selfie_path: Path
+    ocr_path: Path | None = None
+    hubox_user: str = ""
+    hubox_password: str = ""
+    back_path: Path | None = None
+
+    @property
+    def root(self) -> Path:
+        return self.frente_path.parent
+
+
+@dataclass
+class ProfileScan:
+    id: str
+    label: str
+    folder: Path
+    ready: bool
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    profile: Profile | None = None
+
+
+def profiles_dir() -> Path:
+    return PROFILES_DIR.resolve()
+
+
+def _global_config() -> dict[str, Any]:
+    path = PROFILES_DIR / "config.json"
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {"_config_error": str(exc)}
+
+
+def _find_first(folder: Path, candidates: tuple[str, ...]) -> Path | None:
+    for name in candidates:
+        p = folder / name
+        if p.is_file():
+            return p
+    if candidates and "ocr" in candidates[0]:
+        matches = sorted(folder.glob("*ocr*.json"))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _validate_file_exists(path: Path | None, label: str) -> list[str]:
+    if path is None or not path.is_file():
+        return [f"Falta archivo obligatorio: {label}"]
+    return []
+
+
+def _validate_image(path: Path, label: str) -> list[str]:
+    errors: list[str] = []
+    if not path.is_file():
+        return [f"Falta {label}"]
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return [f"No se puede leer {label}: {exc}"]
+    if size < MIN_IMAGE_BYTES:
+        errors.append(f"{label} demasiado pequeño ({size} bytes, mínimo {MIN_IMAGE_BYTES})")
+    try:
+        header = path.read_bytes()[:8]
+    except OSError as exc:
+        return errors + [f"No se puede leer {label}: {exc}"]
+    ext = path.suffix.lower()
+    if ext in {".jpg", ".jpeg"} and header[:2] != b"\xff\xd8":
+        errors.append(f"{label} no parece un JPEG válido")
+    elif ext == ".png" and header[:8] != b"\x89PNG\r\n\x1a\n":
+        errors.append(f"{label} no parece un PNG válido")
+    return errors
+
+
+def _validate_ocr(path: Path | None) -> tuple[dict[str, Any] | None, list[str], list[str]]:
+    if path is None or not path.is_file():
+        return None, [], ["Sin ocr.json local (Hubox extrae datos al vincular)"]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, [f"ocr.json ilegible o inválido: {exc}"], []
+    if not isinstance(data, dict):
+        return None, ["ocr.json debe ser un objeto JSON"], []
+    errors: list[str] = []
+    for key in OCR_REQUIRED_KEYS:
+        val = data.get(key)
+        if not val or not str(val).strip():
+            errors.append(f"ocr.json sin campo obligatorio '{key}'")
+    curp = str(data.get("curp", "")).strip()
+    if curp and len(curp) != 18:
+        errors.append(f"CURP inválida en ocr.json ({len(curp)} caracteres, se esperan 18)")
+    return data, errors, []
+
+
+def _validate_credentials(hubox_user: str, hubox_password: str) -> list[str]:
+    errors: list[str] = []
+    if not hubox_user.strip():
+        errors.append("Faltan credenciales Hubox (hubox_user en config.json o carpeta)")
+    if not hubox_password:
+        errors.append("Faltan credenciales Hubox (hubox_password en config.json o carpeta)")
+    return errors
+
+
+def _label_from_folder(folder_id: str, local_cfg: dict[str, Any], global_cfg: dict[str, Any]) -> str:
+    if local_cfg.get("label"):
+        return str(local_cfg["label"])
+    if folder_id in global_cfg.get("labels", {}):
+        return str(global_cfg["labels"][folder_id])
+    if folder_id.isdigit():
+        sibling = _named_sibling_folder(folder_id)
+        if sibling is not None:
+            return sibling.name.split("_", 1)[1]
+    if "_" in folder_id:
+        return folder_id.split("_", 1)[1]
+    return f"Perfil {folder_id}"
+
+
+def _named_sibling_folder(numeric_id: str) -> Path | None:
+    if not numeric_id.isdigit():
+        return None
+    prefix = f"{numeric_id}_"
+    matches = sorted(
+        (p for p in PROFILES_DIR.iterdir() if p.is_dir() and p.name.startswith(prefix)),
+        key=lambda p: p.name,
+    )
+    return matches[0] if matches else None
+
+
+def _usage_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _load_usage() -> dict[str, Any]:
+    if USAGE_PATH.is_file():
+        try:
+            return json.loads(USAGE_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"profiles": {}}
+
+
+def _save_usage(data: dict[str, Any]) -> None:
+    USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    USAGE_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def profile_usage_info(profile_id: str) -> dict[str, Any]:
+    entry = _load_usage().get("profiles", {}).get(profile_id, {})
+    successes = int(entry.get("successes", 0))
+    discarded = bool(entry.get("discarded", False))
+    return {
+        "successes": successes,
+        "remaining": max(0, MAX_SUCCESSES_PER_PROFILE - successes),
+        "discarded": discarded,
+        "reason": entry.get("reason", ""),
+    }
+
+
+def is_profile_usable(profile_id: str) -> bool:
+    return not profile_usage_info(profile_id)["discarded"]
+
+
+def discard_profile(profile_id: str, reason: str = "") -> None:
+    with _lock:
+        data = _load_usage()
+        profiles = data.setdefault("profiles", {})
+        entry = profiles.setdefault(profile_id, {"successes": 0, "discarded": False})
+        entry["discarded"] = True
+        entry["reason"] = reason or f"Límite de {MAX_SUCCESSES_PER_PROFILE} vinculaciones"
+        entry["discarded_at"] = _usage_now()
+        if int(entry.get("successes", 0)) < MAX_SUCCESSES_PER_PROFILE:
+            entry["successes"] = MAX_SUCCESSES_PER_PROFILE
+        _save_usage(data)
+
+
+def record_profile_success(profile_id: str) -> int:
+    """Registra un éxito; descarta el perfil al llegar a MAX_SUCCESSES_PER_PROFILE."""
+    with _lock:
+        data = _load_usage()
+        profiles = data.setdefault("profiles", {})
+        entry = profiles.setdefault(profile_id, {"successes": 0, "discarded": False})
+        if entry.get("discarded"):
+            return int(entry.get("successes", MAX_SUCCESSES_PER_PROFILE))
+        entry["successes"] = int(entry.get("successes", 0)) + 1
+        count = entry["successes"]
+        if count >= MAX_SUCCESSES_PER_PROFILE:
+            entry["discarded"] = True
+            entry["reason"] = f"{MAX_SUCCESSES_PER_PROFILE} vinculaciones exitosas"
+            entry["discarded_at"] = _usage_now()
+        _save_usage(data)
+        return count
+
+
+def _folder_sort_key(folder: Path) -> tuple[int, str]:
+    prefix = folder.name.split("_", 1)[0]
+    try:
+        return int(prefix), folder.name
+    except ValueError:
+        return 9999, folder.name
+
+
+def scan_profile_folder(folder: Path, global_cfg: dict[str, Any]) -> ProfileScan:
+    folder_id = folder.name
+    local_cfg: dict[str, Any] = {}
+    local_cfg_path = folder / "config.json"
+    if local_cfg_path.is_file():
+        try:
+            local_cfg = json.loads(local_cfg_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            return ProfileScan(
+                id=folder_id,
+                label=folder_id,
+                folder=folder,
+                ready=False,
+                errors=[f"config.json inválido: {exc}"],
+            )
+
+    label = _label_from_folder(folder_id, local_cfg, global_cfg)
+
+    frente = _find_first(folder, FRENTE_NAMES)
+    selfie = _find_first(folder, SELFIE_NAMES)
+    ocr_file = _find_first(folder, OCR_NAMES)
+    back = _find_first(folder, BACK_NAMES)
+
+    hubox_user = str(local_cfg.get("hubox_user") or global_cfg.get("hubox_user") or "")
+    hubox_password = str(local_cfg.get("hubox_password") or global_cfg.get("hubox_password") or "")
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    errors.extend(_validate_file_exists(frente, "front.jpg / frente"))
+    errors.extend(_validate_file_exists(selfie, "selfie.jpg"))
+    if frente:
+        errors.extend(_validate_image(frente, "front"))
+    if selfie:
+        errors.extend(_validate_image(selfie, "selfie"))
+    if back:
+        errors.extend(_validate_image(back, "back"))
+    else:
+        warnings.append("Opcional: back.jpg no encontrado (el flujo genera QRs por OCR)")
+
+    _ocr_data, ocr_errors, ocr_warnings = _validate_ocr(ocr_file)
+    errors.extend(ocr_errors)
+    warnings.extend(ocr_warnings)
+
+    if errors:
+        return ProfileScan(id=folder_id, label=label, folder=folder, ready=False, errors=errors, warnings=warnings)
+
+    assert frente is not None and selfie is not None
+    profile = Profile(
+        id=folder_id,
+        label=label,
+        frente_path=frente.resolve(),
+        selfie_path=selfie.resolve(),
+        ocr_path=ocr_file.resolve() if ocr_file else None,
+        hubox_user=hubox_user,
+        hubox_password=hubox_password,
+        back_path=back.resolve() if back else None,
+    )
+    return ProfileScan(
+        id=folder_id,
+        label=label,
+        folder=folder,
+        ready=True,
+        errors=[],
+        warnings=warnings,
+        profile=profile,
+    )
+
+
+def _is_numeric_pool_folder(folder: Path) -> bool:
+    """Solo carpetas 1, 2, 3… — no 1_NOMBRE ni similares."""
+    return folder.name.isdigit()
+
+
+def scan_all_profiles() -> list[ProfileScan]:
+    base = PROFILES_DIR
+    if not base.is_dir():
+        return [
+            ProfileScan(
+                id="—",
+                label="—",
+                folder=base,
+                ready=False,
+                errors=[f"Carpeta no encontrada: {base.resolve()}"],
+            )
+        ]
+
+    global_cfg = _global_config()
+    scans: list[ProfileScan] = []
+    if "_config_error" in global_cfg:
+        scans.append(
+            ProfileScan(
+                id="config",
+                label="config.json",
+                folder=base,
+                ready=False,
+                errors=[f"config.json inválido: {global_cfg['_config_error']}"],
+            )
+        )
+        global_cfg = {}
+
+    all_folders = sorted(
+        (p for p in base.iterdir() if p.is_dir()),
+        key=_folder_sort_key,
+    )
+    for folder in all_folders[:MAX_PROFILES]:
+        if not _is_numeric_pool_folder(folder):
+            continue
+        scans.append(scan_profile_folder(folder, global_cfg))
+    return scans
+
+
+def load_profiles(*, force_rescan: bool = False) -> list[Profile]:
+    _ = force_rescan
+    return [
+        s.profile
+        for s in scan_all_profiles()
+        if s.ready and s.profile is not None and is_profile_usable(s.profile.id)
+    ]
+
+
+def get_profile(profile_id: str) -> Profile | None:
+    for scan in scan_all_profiles():
+        if scan.id == profile_id and scan.ready and scan.profile:
+            return scan.profile
+    return None
+
+
+def validate_profile(profile_id: str) -> ProfileScan | None:
+    for scan in scan_all_profiles():
+        if scan.id == profile_id:
+            return scan
+    return None
+
+
+def _purge_stale_locks() -> None:
+    now = time.monotonic()
+    for pid in [p for p, (_u, ts) in _busy.items() if now - ts > LOCK_TTL_SECONDS]:
+        _busy.pop(pid, None)
+
+
+def available_profiles() -> list[Profile]:
+    with _lock:
+        _purge_stale_locks()
+        return [p for p in load_profiles() if p.id not in _busy]
+
+
+def user_holds_profile(user_id: int) -> str | None:
+    with _lock:
+        _purge_stale_locks()
+        for pid, (holder, _ts) in _busy.items():
+            if holder == user_id:
+                return pid
+    return None
+
+
+def acquire_next_profile(user_id: int) -> Profile:
+    """Asigna el primer perfil libre en orden (1, 2, 3…)."""
+    with _lock:
+        _purge_stale_locks()
+        for _pid, (holder, _ts) in _busy.items():
+            if holder == user_id:
+                raise RuntimeError("Ya tienes una vinculación en curso. Termínala o usa /cancel.")
+        for profile in load_profiles():
+            if profile.id in _busy:
+                continue
+            _busy[profile.id] = (user_id, time.monotonic())
+            return profile
+        raise RuntimeError("No hay perfiles disponibles en este momento.")
+
+
+def acquire_profile(profile_id: str, user_id: int) -> Profile:
+    scan = validate_profile(profile_id)
+    if scan is None:
+        raise RuntimeError("Perfil no encontrado.")
+    if not scan.ready or scan.profile is None:
+        detail = "; ".join(scan.errors) if scan.errors else "validación fallida"
+        raise RuntimeError(f"Perfil no está listo: {detail}")
+
+    with _lock:
+        _purge_stale_locks()
+        for pid, (holder, _ts) in _busy.items():
+            if holder == user_id and pid != profile_id:
+                raise RuntimeError("Ya tienes una vinculación en curso. Termínala o usa /cancel.")
+        if profile_id in _busy:
+            holder, _ = _busy[profile_id]
+            if holder != user_id:
+                raise RuntimeError("Perfil ocupado, elige otro.")
+            return scan.profile
+        _busy[profile_id] = (user_id, time.monotonic())
+        return scan.profile
+
+
+def release_profile(profile_id: str | None, user_id: int | None = None) -> None:
+    if not profile_id:
+        return
+    with _lock:
+        holder = _busy.get(profile_id)
+        if holder is None:
+            return
+        if user_id is not None and holder[0] != user_id:
+            return
+        _busy.pop(profile_id, None)
+
+
+def release_all_for_user(user_id: int) -> list[str]:
+    released: list[str] = []
+    with _lock:
+        for pid, (holder, _ts) in list(_busy.items()):
+            if holder == user_id:
+                _busy.pop(pid, None)
+                released.append(pid)
+    return released
+
+
+def profile_status() -> list[dict[str, Any]]:
+    with _lock:
+        _purge_stale_locks()
+        result: list[dict[str, Any]] = []
+        for scan in scan_all_profiles():
+            if scan.id in {"—", "config"}:
+                continue
+            holder = _busy.get(scan.id)
+            result.append(
+                {
+                    "id": scan.id,
+                    "label": scan.label,
+                    "ready": scan.ready and is_profile_usable(scan.id),
+                    "busy": holder is not None,
+                    "held_by": holder[0] if holder else None,
+                    "errors": scan.errors,
+                    "warnings": scan.warnings,
+                    **profile_usage_info(scan.id),
+                }
+            )
+        return result
+
+
+def startup_report() -> str:
+    scans = [s for s in scan_all_profiles() if s.id not in {"—", "config"}]
+    active = [s for s in scans if s.ready and is_profile_usable(s.id)]
+    discarded = [s for s in scans if s.ready and not is_profile_usable(s.id)]
+    broken = [s for s in scans if not s.ready]
+    lines = [
+        f"Perfiles en {profiles_dir()}",
+        f"  Activos: {len(active)} / {len(scans)} (máx {MAX_SUCCESSES_PER_PROFILE} éxitos c/u)",
+        f"  Descartados: {len(discarded)}",
+    ]
+    for s in active[:15]:
+        u = profile_usage_info(s.id)
+        lines.append(f"  OK {s.id} — {s.label} ({u['successes']}/{MAX_SUCCESSES_PER_PROFILE})")
+    if len(active) > 15:
+        lines.append(f"  … y {len(active) - 15} más activos")
+    for s in discarded[:5]:
+        u = profile_usage_info(s.id)
+        lines.append(f"  OUT {s.id} — {s.label} ({u['successes']}/{MAX_SUCCESSES_PER_PROFILE})")
+    for s in broken[:5]:
+        lines.append(f"  FAIL {s.id} — {s.label}: {'; '.join(s.errors)}")
+    if not scans:
+        lines.append("  (sin carpetas de perfil — crea 1/, 2/, etc.)")
+    return "\n".join(lines)

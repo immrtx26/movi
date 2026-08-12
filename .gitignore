@@ -1,0 +1,30 @@
+.env
+.hubox_state.json
+bot_data.json
+profile_usage.json
+__pycache__/
+*.pyc
+last_crop.jpg
+har_assets/*.b64
+har_assets/*.jpg
+har_assets/*.png
+
+# Perfiles / sesiones
+profiles/
+perfiles.zip
+
+# Capturas HAR y dumps
+*.har
+flows
+_dbg_*.bin
+
+# Documentos / PII locales
+FRENTE.jpeg
+REVERSO.jpeg
+SELFIE.jpeg
+selfie.jpg
+ESCALANTE_*.txt
+ESCALANTE_*.json
+*.jpeg
+*.jpg
+!har_assets/.gitkeep

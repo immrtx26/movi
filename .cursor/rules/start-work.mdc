@@ -1,0 +1,12 @@
+---
+description: Trigger start-work ritual when user resumes production session
+alwaysApply: false
+---
+
+# Start Work trigger
+
+When the user message is **only** or primarily: `start work`, `start workagent`, `empieza`, `arranca`, or `status operativo`:
+
+1. Read and follow `.cursor/skills/start-work/SKILL.md` immediately.
+2. Run the operational checklist (bot → pool → last enroll) before asking what to do next.
+3. Reply with the **Estado operativo** report format from that skill.
