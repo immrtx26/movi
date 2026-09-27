@@ -203,3 +203,9 @@ def profile_status() -> str:
             )
 
         return "\n".join(lineas)
+
+
+def is_profile_busy(profile_id, ignore_user_id=None):
+    with _lock:
+        p=_profiles.get(str(profile_id))
+        return bool(p and p.in_use_by is not None and (ignore_user_id is None or p.in_use_by!=ignore_user_id))

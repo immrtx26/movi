@@ -84,16 +84,12 @@ def _detect_face(path: Path) -> bool:
     try:
         import cv2
         img=cv2.imread(str(path))
-        if img is None:
-            return False
+        if img is None: return False
         gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
         cascade=cv2.CascadeClassifier(cv2.data.haarcascades+"haarcascade_frontalface_default.xml")
-        faces=cascade.detectMultiScale(gray,1.05,3,minSize=(40,40))
-        if len(faces):
-            return True
+        if len(cascade.detectMultiScale(gray,1.05,3,minSize=(40,40))): return True
         gray=cv2.equalizeHist(gray)
-        faces=cascade.detectMultiScale(gray,1.03,2,minSize=(32,32))
-        return len(faces)>0
+        return len(cascade.detectMultiScale(gray,1.03,2,minSize=(32,32)))>0
     except Exception:
         return False
 

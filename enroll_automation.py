@@ -437,3 +437,35 @@ def run_enroll_flow(
     """Flujo completo (útil para CLI/tests)."""
     client, tid = start_and_send_otp(profile, phone, hubox_user=hubox_user, hubox_password=hubox_password)
     return complete_enroll(profile, client, tid, otp)
+
+
+# ---- V6 QR cascade helper ----
+def _qr_cascade_detect(image_path):
+    """Fallback QR detector: OpenCV -> pyzbar -> zxing-cpp."""
+    try:
+        import cv2
+        img=cv2.imread(str(image_path))
+        if img is not None:
+            det=cv2.QRCodeDetector()
+            ok,decoded,_,_=det.detectAndDecodeMulti(img)
+            if ok and decoded:
+                vals=[v for v in decoded if v]
+                if vals: return vals
+            one,_,_=det.detectAndDecode(img)
+            if one: return [one]
+    except Exception:
+        pass
+    try:
+        from pyzbar.pyzbar import decode
+        from PIL import Image
+        vals=[d.data.decode("utf-8","ignore") for d in decode(Image.open(image_path)) if d.data]
+        if vals: return vals
+    except Exception:
+        pass
+    try:
+        import zxingcpp
+        vals=[r.text for r in zxingcpp.read_barcodes(str(image_path)) if getattr(r,"text","")]
+        if vals: return vals
+    except Exception:
+        pass
+    return []

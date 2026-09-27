@@ -38,6 +38,7 @@ from bot_store import (
 )
 from enroll_automation import FlowError, NetworkError, complete_enroll, start_and_send_otp
 from profile_pool import (
+    prepare_pool,
     MAX_SUCCESSES_PER_PROFILE,
     acquire_next_profile,
     discard_profile,
@@ -658,6 +659,9 @@ async def on_add_selfie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return MENU
 
+    await asyncio.to_thread(_run_profile_prep, notify_log=False)
+    prepare_pool()
+
     total = count_user_profiles(uid)
     await update.effective_message.reply_text(
         "✅ *Perfil agregado y listo*\n\n"
@@ -897,6 +901,7 @@ def main() -> None:
 
     log.info("Preparando perfiles…")
     _run_profile_prep(notify_log=True)
+    prepare_pool()
     log.info("Bot arrancando\n%s", startup_report())
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
