@@ -162,26 +162,51 @@ def _upload_staging_dir(uid: int) -> Path:
     return path
 
 
+# --- PATCH: _save_user_image con preferencia por document y aviso de compresión ---
 async def _save_user_image(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     dest: Path,
 ) -> Path | None:
-    """Guarda foto o documento de imagen enviada por el usuario."""
+    """Guarda foto o documento de imagen enviada por el usuario.
+
+    IMPORTANTE: Preferimos 'document' (sin compresión de Telegram).
+    Si llega como 'photo' (comprimida), se guarda pero se marca advertencia
+    porque Hubox puede rechazarla por isFake alto.
+    """
     msg = update.effective_message
     if not msg:
         return None
+
     file_id = None
-    if msg.photo:
-        file_id = msg.photo[-1].file_id
-    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+    is_compressed = False
+
+    # 1. Preferir documento (sin compresión)
+    if msg.document and (msg.document.mime_type or "").startswith("image/"):
         file_id = msg.document.file_id
+    # 2. Foto comprimida por Telegram: usar la de mayor resolución disponible
+    elif msg.photo:
+        file_id = msg.photo[-1].file_id
+        is_compressed = True
+
     if not file_id:
         return None
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     tg_file = await context.bot.get_file(file_id)
     await tg_file.download_to_drive(custom_path=str(dest))
+
+    if is_compressed:
+        log.warning(
+            "Usuario %s envió foto comprimida (%s). Hubox podría rechazarla (isFake). "
+            "Recomendar 'Enviar como archivo'.",
+            user_id(update),
+            dest.name,
+        )
+        context.user_data["compressed_upload_warning"] = True
+
     return dest
+# --- FIN PATCH ---
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -445,7 +470,6 @@ async def cmd_creditos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 parse_mode=ParseMode.MARKDOWN,
             )
         else:
-            # número solo = sumar
             delta = int(raw)
             bal = add_credits(target, delta, reason=f"admin_adjust_by:{uid}")
             await update.effective_message.reply_text(
@@ -635,6 +659,8 @@ async def on_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "➕ *Agregar perfil*\n\n"
             f"Cupo: *{detail}*\n\n"
             "Envía la foto del *frente* (anverso) de la INE.\n\n"
+            "⚠️ *Importante:* envíala como *ARCHIVO* (clip → Archivo), no como foto. "
+            "Así evitamos que Telegram la comprima y Hubox no la rechace por isFake.\n\n"
             "_Orden: frente → reverso → selfie._\n"
             "Puedes agregar varios (máx 10). Solo entran al pool si pasan validación.\n"
             f"Cada perfil se borra solo al llegar a {MAX_SUCCESSES_PER_PROFILE} activaciones "
@@ -759,7 +785,8 @@ async def on_add_front(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     context.user_data["add_step"] = "reverso"
     await update.effective_message.reply_text(
         "✅ Frente recibido.\n\nAhora envía la foto del *reverso* de la INE "
-        "(debe verse nítido, con los 2 códigos QR).",
+        "(debe verse nítido, con los 2 códigos QR).\n\n"
+        "Recuerda: *envíala como archivo* para evitar compresión.",
         parse_mode=ParseMode.MARKDOWN,
     )
     return ADD_BACK
@@ -806,6 +833,21 @@ async def on_add_selfie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             "❌ Faltan fotos del proceso. Empieza de nuevo desde el menú."
         )
         return await show_menu(update, context, cleanup=False)
+
+    # --- PATCH: aviso si alguna imagen llegó comprimida ---
+    if context.user_data.pop("compressed_upload_warning", False):
+        await update.effective_message.reply_text(
+            "⚠️ *Advertencia de calidad*\n\n"
+            "Alguna de las imágenes se envió como *foto* (comprimida por Telegram). "
+            "Hubox podría rechazarla por `isFake` alto.\n\n"
+            "**Recomendación para futuras subidas:**\n"
+            "1. Abre Telegram → clip 📎 → *Archivo*\n"
+            "2. Selecciona la foto desde tu galería\n"
+            "3. Así se envía sin comprimir y con metadatos intactos.\n\n"
+            "El perfil se validará igual, pero si Hubox lo rechaza, reintenta con este método.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    # --- FIN PATCH ---
 
     await update.effective_message.reply_text(
         "⏳ Validando perfil y preparando far/close face (480×640)…"
@@ -965,7 +1007,6 @@ async def on_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not profile or not track_id or not client:
             raise FlowError("Sesión expirada. Inicia de nuevo.", refundable=True)
 
-        # user_holds_profile devuelve bool (no el id del perfil)
         if not user_holds_profile(uid):
             raise FlowError("El perfil ya no está asignado a tu sesión.", refundable=True)
 
@@ -1025,12 +1066,22 @@ async def on_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return await show_menu(update, context, cleanup=False)
 
 
+# --- PATCH: main() con chequeo defensivo de JobQueue ---
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Falta TELEGRAM_BOT_TOKEN en .env")
 
     app = Application.builder().token(token).build()
+
+    # Chequeo defensivo: sin JobQueue los timeouts de ConversationHandler no funcionan.
+    if app.job_queue is None:
+        raise SystemExit(
+            "CRÍTICO: JobQueue no está activo.\n"
+            "Instala 'python-telegram-bot[job-queue]' y reinicia el bot.\n"
+            "Verifica requirements.txt y el Dockerfile."
+        )
+    log.info("JobQueue activo - los timeouts de conversación funcionarán.")
 
     photo_or_image = (filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND
     conv = ConversationHandler(
@@ -1090,6 +1141,7 @@ def main() -> None:
     prepare_pool()
     log.info("Bot arrancando\n%s", startup_report())
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+# --- FIN PATCH ---
 
 
 if __name__ == "__main__":
