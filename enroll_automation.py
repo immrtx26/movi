@@ -831,3 +831,113 @@ def complete_enroll(
     is_fake = float(det.get("isFake") or 0)
     if is_fake >= 30:
         raise FlowError(
+            f"INE rechazada por Hubox (isFake={is_fake}). "
+            "La imagen del anverso parece alterada/borrosa. "
+            "Sugerencia: envía el anverso como ARCHIVO (no como foto) para evitar la compresión de Telegram, "
+            "y tómalo con buena luz, sin reflejos y sin filtros.",
+            refundable=False,
+            discard_profile=True,
+        )
+    # --- FIN PATCH ---
+
+    try:
+        ocr_resp = hubox.ocr(track_id, crop_b64)
+    except requests.RequestException as exc:
+        raise NetworkError(str(exc)) from exc
+    except RuntimeError as exc:
+        raise NetworkError(str(exc)) from exc
+
+    if not ocr_resp.get("success"):
+        err = str(ocr_resp.get("error", ""))
+        if err == "CURP_MAX_10" or ocr_resp.get("max10"):
+            raise FlowError(
+                "Este perfil ya alcanzo el limite de 10 vinculaciones en Hubox.",
+                refundable=True,
+                discard_profile=True,
+            )
+        raise FlowError(
+            f"OCR fallo: {ocr_resp.get('reason') or err or 'error desconocido'}",
+            refundable=False,
+        )
+
+    qr1 = qr2 = ""
+    has_pair_from_image = False
+    if profile.back_path and profile.back_path.is_file():
+        try:
+            qr1, qr2 = _extract_qrs_from_reverso(profile.back_path, allow_single=True)
+            has_pair_from_image = bool(qr1 and qr2)
+            if qr1 and not qr2:
+                log.info("Reverso con 1 QR; si hace falta se usará genera-qrs")
+        except FlowError as exc:
+            log.warning("No se leyeron QR del reverso: %s", exc)
+        except Exception as exc:
+            log.warning("Error leyendo QR del reverso: %s", exc)
+
+    ocr = _resolve_ocr_data(
+        profile, ocr_resp, allow_incomplete=has_pair_from_image
+    )
+
+    try:
+        if has_pair_from_image:
+            pass
+        else:
+            qr1, qr2 = _resolve_qr_pair(profile, crop_b64, ocr)
+            if not qr1:
+                raise FlowError("No se obtuvieron QRs para el enroll.", refundable=True)
+    except NetworkError:
+        raise
+    except FlowError:
+        raise
+    try:
+        qrs = hubox.qrs(track_id, qr1, qr2)
+    except requests.RequestException as exc:
+        raise NetworkError(str(exc)) from exc
+    except RuntimeError as exc:
+        raise NetworkError(str(exc)) from exc
+
+    if not qrs.get("success"):
+        raise FlowError(
+            f"QRs rechazados: {json.dumps(qrs, ensure_ascii=False)[:300]}",
+            refundable=False,
+        )
+
+    try:
+        bio = hubox.biometric(track_id, far_b64, close_b64, retries=2)
+    except requests.RequestException as exc:
+        raise NetworkError(str(exc)) from exc
+    except RuntimeError as exc:
+        raise NetworkError(str(exc)) from exc
+
+    if not bio.get("success"):
+        err = str(bio.get("error") or "")
+        if err == "RESET_STEP2_TIPO_INE_INVALID":
+            raise FlowError(
+                "Hubox invalido el tipo de INE en biometria (RESET_STEP2_TIPO_INE_INVALID). "
+                "Reintenta con otro perfil; far/close o el anverso pueden no coincidir.",
+                refundable=False,
+                discard_profile=True,
+            )
+        raise FlowError(
+            f"Biometria fallo: {json.dumps(bio, ensure_ascii=False)[:300]}",
+            refundable=False,
+        )
+
+    bio["track_id"] = bio.get("track_id") or track_id
+    bio["profile_label"] = profile.label
+    bio["ocr_nombre"] = ocr.get("nombre")
+    return bio
+
+
+def run_enroll_flow(
+    profile: Profile,
+    phone: str,
+    otp: str,
+    *,
+    hubox_user: str | None = None,
+    hubox_password: str | None = None,
+) -> dict[str, Any]:
+    """Flujo completo (util para CLI/tests)."""
+    client, tid = start_and_send_otp(
+        profile, phone, hubox_user=hubox_user, hubox_password=hubox_password
+    )
+    return complete_enroll(profile, client, tid, otp)
