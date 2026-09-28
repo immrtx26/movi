@@ -1,4 +1,4 @@
-python-telegram-bot>=22.0
+python-telegram-bot[job-queue]>=22.0
 python-dotenv>=1.0
 requests>=2.31
 cryptography>=42.0
