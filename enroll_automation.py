@@ -114,8 +114,13 @@ def _get_yunet_detector():
     return _yunet_detector
 
 
+# --- PATCH: _get_haar_cascade robusto con fallback a ./models/ ---
 def _get_haar_cascade():
-    """Busca haarcascade en varias rutas (headless a veces no tiene cv2.data usable)."""
+    """Busca haarcascade en varias rutas (headless a veces no tiene cv2.data usable).
+
+    Fallback final: usa ./models/haarcascade_frontalface_default.xml si no existe en el sistema.
+    El Dockerfile pre-descarga ese XML para garantizar que exista.
+    """
     global _haar_cascade, _haar_tried
     if _haar_tried:
         return _haar_cascade
@@ -123,15 +128,19 @@ def _get_haar_cascade():
     try:
         import cv2
 
-        root = Path(__file__).resolve().parent
-        candidates: list[str] = [
-            str(root / "models" / "haarcascade_frontalface_default.xml"),
-            str(root / "haarcascade_frontalface_default.xml"),
-        ]
+        candidates: list[str] = []
+
+        # 1) Ruta oficial de cv2.data (si existe)
         try:
-            candidates.append(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+            data_dir = getattr(cv2, "data", None)
+            if data_dir is not None:
+                candidates.append(
+                    str(Path(data_dir.haarcascades) / "haarcascade_frontalface_default.xml")
+                )
         except Exception:
             pass
+
+        # 2) Rutas relativas al paquete cv2 instalado
         try:
             base = Path(cv2.__file__).resolve().parent
             candidates.extend(
@@ -143,12 +152,20 @@ def _get_haar_cascade():
             )
         except Exception:
             pass
+
+        # 3) Rutas típicas en Debian/slim
         candidates.extend(
             [
                 "/usr/local/lib/python3.11/site-packages/cv2/data/haarcascade_frontalface_default.xml",
                 "/usr/lib/python3/dist-packages/cv2/data/haarcascade_frontalface_default.xml",
+                "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
             ]
         )
+
+        # 4) Fallback local del repo (models/ o raíz) — lo usa el Dockerfile
+        local_model = Path(__file__).resolve().parent / "models" / "haarcascade_frontalface_default.xml"
+        local_root = Path(__file__).resolve().parent / "haarcascade_frontalface_default.xml"
+        candidates.extend([str(local_model), str(local_root)])
 
         for path in candidates:
             if not path:
@@ -160,11 +177,16 @@ def _get_haar_cascade():
                 _haar_cascade = cascade
                 log.info("Haar cascade cargado: %s", path)
                 return _haar_cascade
-        log.warning("Haar cascade no encontrado en ninguna ruta conocida")
+
+        log.warning(
+            "Haar cascade no encontrado. Rutas probadas: %s",
+            "; ".join(candidates),
+        )
     except Exception as exc:
         log.warning("Error cargando Haar: %s", exc)
     _haar_cascade = None
     return None
+# --- FIN PATCH ---
 
 
 def _detect_face_center(img_bgr) -> tuple[float, float] | None:
@@ -242,15 +264,8 @@ def _pil_to_png_b64(img) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _adjust_brightness(img, factor: float):
-    """factor>1 más claro, <1 más oscuro (simula cambio de luz entre far/close)."""
-    from PIL import ImageEnhance
-
-    return ImageEnhance.Brightness(img).enhance(factor)
-
-
 def _selfie_pair_480x640(path: Path) -> tuple[str, str]:
-    """farFace + closeFace distintos a 480x640 PNG (centrados en rostro)."""
+    """farFace + closeFace distintos a 480x640 PNG."""
     import base64
     import io
 
@@ -258,32 +273,9 @@ def _selfie_pair_480x640(path: Path) -> tuple[str, str]:
 
     raw_b64 = _b64_or_text(path)
     img = Image.open(io.BytesIO(base64.b64decode(raw_b64))).convert("RGB")
-    # far = más contexto; close = más zoom al rostro + ligera diferencia de luz
-    far = _cover_crop(img, zoom=0.95)
-    close = _cover_crop(img, zoom=1.55)
-    far = _adjust_brightness(far, 1.05)
-    close = _adjust_brightness(close, 0.97)
+    far = _cover_crop(img, zoom=1.0)
+    close = _cover_crop(img, zoom=1.45)
     return _pil_to_png_b64(far), _pil_to_png_b64(close)
-
-
-def _selfie_pair_variants(path: Path) -> list[tuple[str, str]]:
-    """Varias parejas far/close por si Hubox rechaza liveness en el primer intento."""
-    import base64
-    import io
-
-    from PIL import Image
-
-    raw_b64 = _b64_or_text(path)
-    img = Image.open(io.BytesIO(base64.b64decode(raw_b64))).convert("RGB")
-    pairs: list[tuple[str, str]] = []
-    for z_far, z_close, b_far, b_close in (
-        (0.95, 1.55, 1.05, 0.97),
-        (1.0, 1.45, 1.0, 1.0),
-    ):
-        far = _adjust_brightness(_cover_crop(img, zoom=z_far), b_far)
-        close = _adjust_brightness(_cover_crop(img, zoom=z_close), b_close)
-        pairs.append((_pil_to_png_b64(far), _pil_to_png_b64(close)))
-    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -307,36 +299,20 @@ def _qr_payloads_zxing(mat) -> list[bytes]:
 
     payloads: list[bytes] = []
     try:
-        # Preferir formatos de INE; si la API no acepta filtros, leer todo
         try:
             formats = [
                 zxingcpp.BarcodeFormat.QRCode,
                 zxingcpp.BarcodeFormat.PDF417,
                 zxingcpp.BarcodeFormat.DataMatrix,
             ]
-            try:
-                results = zxingcpp.read_barcodes(
-                    mat,
-                    formats=formats,
-                    try_rotate=True,
-                    try_downscale=True,
-                    try_invert=True,
-                )
-            except TypeError:
-                results = zxingcpp.read_barcodes(mat, formats=formats)
+            results = zxingcpp.read_barcodes(mat, formats=formats)
         except TypeError:
-            try:
-                results = zxingcpp.read_barcodes(
-                    mat, try_rotate=True, try_downscale=True, try_invert=True
-                )
-            except TypeError:
-                results = zxingcpp.read_barcodes(mat)
+            results = zxingcpp.read_barcodes(mat)
     except Exception:
         return []
     for result in results:
         try:
             fmt = _barcode_format_name(result)
-            # Ignorar Code128/EAN del borde superior de la INE
             if fmt and any(x in fmt for x in ("CODE128", "CODE_128", "EAN", "UPC", "CODABAR")):
                 continue
             raw = getattr(result, "bytes", None)
@@ -345,13 +321,9 @@ def _qr_payloads_zxing(mat) -> list[bytes]:
             else:
                 raw = (result.text or "").encode("latin-1", errors="replace")
             text = (result.text or "").strip()
-            # QR de verificación INE (http://qr.ine.mx/...) no sirve para Hubox enroll_qrs;
-            # se marca aparte y no cuenta como código binario.
-            if text.lower().startswith("http://qr.ine.mx") or text.lower().startswith("https://qr.ine.mx"):
+            if text.lower().startswith("http"):
                 continue
-            if text.lower().startswith("http") and "ine.mx" not in text.lower():
-                continue
-            min_len = 15 if "PDF" in fmt else 30
+            min_len = 20 if "PDF" in fmt else 40
             if len(raw) < min_len and len(text) < min_len:
                 continue
             payloads.append(raw)
@@ -377,7 +349,6 @@ def _qr_payloads_pyzbar(mat) -> list[bytes]:
         else:
             gray = mat
         symbols = [ZBarSymbol.QRCODE]
-        # PDF417: presente en muchas INE/IFE de generación anterior
         if hasattr(ZBarSymbol, "PDF417"):
             symbols.append(ZBarSymbol.PDF417)
         decoded = pyzbar.decode(gray, symbols=symbols)
@@ -387,7 +358,7 @@ def _qr_payloads_pyzbar(mat) -> list[bytes]:
             if text.lower().startswith("http"):
                 continue
             sym = str(getattr(obj, "type", "") or "").upper()
-            min_len = 15 if "PDF" in sym else 30
+            min_len = 20 if "PDF" in sym else 40
             if len(raw) < min_len:
                 continue
             payloads.append(bytes(raw))
@@ -408,51 +379,52 @@ def _qr_payloads_from_mat(mat) -> list[bytes]:
 
 
 def _build_qr_variants(img):
-    """Variantes ligeras para QR/PDF417 (evitar OOM en Railway ~512MB)."""
+    """Variantes para QR/PDF417 (Telegram comprime; a veces el reverso viene rotado)."""
     import cv2
-    import gc
-
-    h, w = img.shape[:2]
-    max_side = 1200
-    if max(h, w) > max_side:
-        scale = max_side / max(h, w)
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        h, w = img.shape[:2]
-        gc.collect()
 
     variants = [img]
+    h, w = img.shape[:2]
+
     try:
         variants.append(cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE))
         variants.append(cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE))
+        variants.append(cv2.rotate(img, cv2.ROTATE_180))
     except Exception:
         pass
-    try:
-        variants.append(img[0 : int(h * 0.55), :])
-        variants.append(img[int(h * 0.15) : int(h * 0.65), :])
-    except Exception:
-        pass
-    for scale in (1.5, 2.0):
+
+    for scale in (1.5, 2.0, 2.5, 3.0):
         variants.append(
-            cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+            cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         )
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     variants.append(cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR))
-    thr = cv2.adaptiveThreshold(
-        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
-    )
-    variants.append(cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR))
-    variants.append(cv2.cvtColor(255 - enhanced, cv2.COLOR_GRAY2BGR))
-    return variants
+    variants.append(cv2.cvtColor(cv2.equalizeHist(gray), cv2.COLOR_GRAY2BGR))
 
+    for block, C in ((31, 5), (21, 10), (41, 3)):
+        thr = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, C
+        )
+        variants.append(cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR))
+
+    variants.append(cv2.cvtColor(255 - enhanced, cv2.COLOR_GRAY2BGR))
+
+    for angle in (-3, 3, -6, 6, -10, 10):
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+        variants.append(
+            cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        )
+
+    return variants
 
 
 def _extract_qrs_from_reverso(
     back_path: Path,
     *,
     allow_single: bool = True,
-    max_variants: int = 12,
+    max_variants: int = 24,
 ) -> tuple[str, str]:
     """
     Lee códigos del reverso INE (ambos tipos oficiales):
@@ -482,7 +454,6 @@ def _extract_qrs_from_reverso(
     best: list[bytes] = []
     for mat in _build_qr_variants(img)[: max(1, max_variants)]:
         payloads = _qr_payloads_from_mat(mat)
-        # Dedup ya ocurre dentro; preferir el conjunto con más códigos / más bytes
         score = (len(payloads), sum(len(p) for p in payloads))
         best_score = (len(best), sum(len(p) for p in best))
         if score > best_score:
@@ -491,23 +462,20 @@ def _extract_qrs_from_reverso(
             break
 
     payloads = best
-    # Hubox a veces indexa payloads con prefijo 0x00 0x00 / 0x00 0x01
     indexed = [p for p in payloads if len(p) >= 2 and p[0] == 0 and p[1] in (0, 1)]
     if len(indexed) >= 2:
         indexed.sort(key=lambda p: p[1])
         qr1, qr2 = indexed[0], indexed[1]
     elif len(payloads) >= 2:
-        # Los dos más largos (típicamente los 2 QR grandes o PDF417 + QR)
         payloads_sorted = sorted(payloads, key=len, reverse=True)
         qr1, qr2 = payloads_sorted[0], payloads_sorted[1]
     elif len(payloads) == 1 and allow_single:
         qr1, qr2 = payloads[0], b""
     else:
         raise FlowError(
-            f"Reverso sin códigos binarios legibles (encontrados: {len(payloads)}). "
-            "Tipo A: 2 QR grandes. Tipo B (INE/IFE antigua): código de barras ancho PDF417. "
-            "El QR chico de qr.ine.mx no sirve para Hubox. "
-            "Acerca más al PDF417, luz pareja, envía como documento (no foto).",
+            f"Reverso sin códigos legibles (encontrados: {len(payloads)}). "
+            "Tipos soportados: (A) 2 QR grandes  (B) PDF417 + QR. "
+            "Foto nítida, de cerca, sin reflejos; si está de lado, también sirve.",
             refundable=False,
         )
 
@@ -526,11 +494,9 @@ def _extract_qrs_from_reverso(
 
 
 def count_qrs_in_reverso(back_path: Path) -> tuple[int, str | None]:
-    """Util para validación de upload. Devuelve (cantidad, error_opcional)."""
+    """Util para validacion de upload. Devuelve (cantidad, error_opcional)."""
     try:
-        qr1, qr2 = _extract_qrs_from_reverso(
-            back_path, allow_single=True, max_variants=12
-        )
+        qr1, qr2 = _extract_qrs_from_reverso(back_path, allow_single=True)
         n = 0
         if qr1:
             n += 1
@@ -601,7 +567,6 @@ def _build_biograficos(ocr: dict[str, Any]) -> str:
         ocr["direccion"], "", "", eid, "", "", ocr.get("genero", "M"),
         "", "", "", time.strftime("%Y%m%d"), "",
     ])
-
 
 
 def _flatten_ocr_dict(ocr_resp: dict[str, Any]) -> dict[str, Any]:
@@ -751,7 +716,6 @@ def _resolve_ocr_data(
     if parsed:
         return parsed
 
-    # Hubox OK pero sin campos al cliente (caso típico actual)
     if isinstance(ocr_resp, dict) and ocr_resp.get("success") and allow_incomplete:
         log.info(
             "OCR Hubox sin campos al cliente (keys=%s); se continúa con QR del reverso",
@@ -769,7 +733,6 @@ def _resolve_ocr_data(
         "si no, agrega ocr.json al perfil o usa anverso más nítido.",
         refundable=True,
     )
-
 
 
 def start_and_send_otp(
@@ -864,17 +827,18 @@ def complete_enroll(
     if not crop_b64:
         raise FlowError("Hubox no devolvio recorte de INE.", refundable=False)
 
+    # --- PATCH: umbral isFake a 30 + mensaje más claro ---
     is_fake = float(det.get("isFake") or 0)
-    # Hubox anti-fraude: umbral configurable (default 25). No borramos el perfil
-    # para que el usuario pueda re-subir anverso; reembolsamos el crédito.
-    fake_threshold = float(__import__("os").getenv("HUBOX_ISFAKE_THRESHOLD", "25") or 25)
-    if is_fake >= fake_threshold:
+    if is_fake >= 30:
         raise FlowError(
             f"INE rechazada por Hubox (isFake={is_fake}). "
-            "Usa otra foto de anverso más nítida (mejor como documento, sin reflejos).",
-            refundable=True,
-            discard_profile=False,
+            "La imagen del anverso parece alterada/borrosa. "
+            "Sugerencia: envía el anverso como ARCHIVO (no como foto) para evitar la compresión de Telegram, "
+            "y tómalo con buena luz, sin reflejos y sin filtros.",
+            refundable=False,
+            discard_profile=True,
         )
+    # --- FIN PATCH ---
 
     try:
         ocr_resp = hubox.ocr(track_id, crop_b64)
@@ -896,7 +860,6 @@ def complete_enroll(
             refundable=False,
         )
 
-    # 1) Intentar 2 QR del reverso (no requieren campos OCR en cliente)
     qr1 = qr2 = ""
     has_pair_from_image = False
     if profile.back_path and profile.back_path.is_file():
@@ -910,15 +873,13 @@ def complete_enroll(
         except Exception as exc:
             log.warning("Error leyendo QR del reverso: %s", exc)
 
-    # 2) OCR: completo si hay ocr.json / campos Hubox; incompleto OK si ya hay 2 QR
     ocr = _resolve_ocr_data(
         profile, ocr_resp, allow_incomplete=has_pair_from_image
     )
 
-    # 3) Completar par de QR (genera-qrs solo si falta el 2.º o no hubo lectura)
     try:
         if has_pair_from_image:
-            pass  # ya tenemos qr1, qr2
+            pass
         else:
             qr1, qr2 = _resolve_qr_pair(profile, crop_b64, ocr)
             if not qr1:
@@ -940,69 +901,25 @@ def complete_enroll(
             refundable=False,
         )
 
-    # Parejas far/close secuenciales (bajo consumo RAM)
-    import gc
-
-    def _iter_bio_pairs():
-        if (
-            profile.far_path
-            and profile.close_path
-            and profile.far_path.is_file()
-            and profile.close_path.is_file()
-        ):
-            yield _b64_or_text(profile.far_path), _b64_or_text(profile.close_path)
-        if profile.selfie_path and profile.selfie_path.is_file():
-            for pair in _selfie_pair_variants(profile.selfie_path)[:2]:
-                yield pair
-        yield far_b64, close_b64
-
-    bio: dict[str, Any] = {}
-    last_bio_err = ""
-    for idx, (f_b64, c_b64) in enumerate(_iter_bio_pairs()):
-        if idx >= 3:
-            break
-        try:
-            bio = hubox.biometric(track_id, f_b64, c_b64, retries=1)
-        except requests.RequestException as exc:
-            raise NetworkError(str(exc)) from exc
-        except RuntimeError as exc:
-            raise NetworkError(str(exc)) from exc
-        finally:
-            try:
-                del f_b64, c_b64
-            except Exception:
-                pass
-            gc.collect()
-        if bio.get("success"):
-            log.info("Biometría OK (par far/close #%s)", idx + 1)
-            break
-        last_bio_err = str(bio.get("error") or bio)
-        log.warning("Biometría intento %s falló: %s", idx + 1, last_bio_err[:120])
-        if "LIVENESS" not in last_bio_err.upper() and "NOT_REAL" not in last_bio_err.upper():
-            break
+    try:
+        bio = hubox.biometric(track_id, far_b64, close_b64, retries=2)
+    except requests.RequestException as exc:
+        raise NetworkError(str(exc)) from exc
+    except RuntimeError as exc:
+        raise NetworkError(str(exc)) from exc
 
     if not bio.get("success"):
-        err = str(bio.get("error") or last_bio_err or "")
+        err = str(bio.get("error") or "")
         if err == "RESET_STEP2_TIPO_INE_INVALID":
             raise FlowError(
-                "Hubox invalidó el tipo de INE en biometría (RESET_STEP2_TIPO_INE_INVALID). "
+                "Hubox invalido el tipo de INE en biometria (RESET_STEP2_TIPO_INE_INVALID). "
                 "Reintenta con otro perfil; far/close o el anverso pueden no coincidir.",
                 refundable=False,
                 discard_profile=True,
             )
-        if "LIVENESS" in err.upper() or "NOT_REAL" in err.upper():
-            raise FlowError(
-                "Biometría rechazada (liveness): Hubox no detectó rostro en vivo. "
-                "Usa selfie tomada al momento (no foto de foto/pantalla), luz pareja, "
-                "rostro de frente sin lentes oscuros ni mascarilla. "
-                f"Detalle: {err}",
-                refundable=True,
-                discard_profile=False,
-            )
         raise FlowError(
             f"Biometria fallo: {json.dumps(bio, ensure_ascii=False)[:300]}",
-            refundable=True,
-            discard_profile=False,
+            refundable=False,
         )
 
     bio["track_id"] = bio.get("track_id") or track_id
