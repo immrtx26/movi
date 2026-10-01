@@ -92,7 +92,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("movistar-bot")
+log = logging.getLogger("vomistar_by_immrtx_bot")
 
 
 def user_id(update: Update) -> int:
@@ -111,7 +111,7 @@ def ensure_not_banned(uid: int) -> str | None:
     if is_banned(uid):
         info = get_user_info(uid)
         reason = info.get("ban_reason") or "bloqueado por admin"
-        return f"🚫 Tu cuenta está bloqueada.\nMotivo: {reason}\nContacta al administrador."
+        return f"🚫 Tu cuenta está bloqueada.\nMotivo: {reason}\nContacta al administrador @reddit61."
     return None
 
 
@@ -329,8 +329,8 @@ async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = update.effective_message or (update.callback_query.message if update.callback_query else None)
     if msg:
         await msg.reply_text(
-            "⏱ Sesión expirada por inactividad.\n"
-            f"Si se había cobrado, se reembolsó la activación (${ACTIVATION_COST_MXN} MXN).",
+            "⏱ Se expiro tu sesión por inactividad.\n"
+            f"Si se te cobró, se reembolsará la activación (${ACTIVATION_COST_MXN} MXN).",
         )
     return await show_menu(update, context, cleanup=False)
 
