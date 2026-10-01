@@ -10,7 +10,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 STORE_PATH = ROOT / "profiles" / "bot_data.json"  # dentro del volume Railway /app/profiles
-ACTIVATION_COST_MXN = 15
+ACTIVATION_COST_MXN = 120
 
 _lock = threading.Lock()
 
@@ -218,7 +218,7 @@ def redeem_key(user_id: int, code: str) -> int:
     with _lock:
         data = _load()
         if bool(data["users"].get(str(user_id), {}).get("banned", False)):
-            raise StoreError("Tu cuenta está bloqueada. Contacta al admin.")
+            raise StoreError("Tu cuenta está bloqueada. Contacta al admin @reddit61.")
         key = data["keys"].get(code)
         if not key:
             raise StoreError("Key inválida o inexistente.")
